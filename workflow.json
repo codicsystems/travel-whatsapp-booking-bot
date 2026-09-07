@@ -1,0 +1,538 @@
+{
+  "name": "Travel enquiry bot — WhatsApp",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-enquiry",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "webhook-inbound",
+      "name": "WhatsApp webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        300
+      ],
+      "webhookId": "whatsapp-enquiry"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verify the X-Hub-Signature-256 header before trusting anything.\n//\n// Meta signs every webhook with your app secret. Without this check, anyone\n// who learns your webhook URL can post fake enquiries into your CRM and\n// trigger outbound WhatsApp messages in your name.\n//\n// APP_SECRET must be set as an n8n environment variable.\n\nconst crypto = require('crypto');\n\nconst secret = $env.WHATSAPP_APP_SECRET;\nif (!secret) {\n  throw new Error('WHATSAPP_APP_SECRET is not set. Refusing to process unverified webhooks.');\n}\n\nconst item = $input.first();\nconst headers = item.json.headers || {};\nconst signature = headers['x-hub-signature-256'] || '';\n\n// rawBody comes through as a Buffer when the webhook node has rawBody enabled.\nconst raw = item.binary && item.binary.data\n  ? Buffer.from(item.binary.data.data, 'base64').toString('utf8')\n  : JSON.stringify(item.json.body);\n\nconst expected = 'sha256=' + crypto.createHmac('sha256', secret).update(raw, 'utf8').digest('hex');\n\nconst a = Buffer.from(signature);\nconst b = Buffer.from(expected);\n\nif (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {\n  throw new Error('Webhook signature did not verify. Dropping the request.');\n}\n\nreturn [{ json: typeof raw === 'string' ? JSON.parse(raw) : item.json.body }];"
+      },
+      "id": "verify-signature",
+      "name": "Verify signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalise the Meta payload into something the rest of the workflow can use.\n//\n// WhatsApp webhooks arrive for many reasons — delivery receipts, read receipts,\n// status changes — and most of them are not a customer message. Filter early\n// so nothing downstream has to guess.\n\nconst body = $input.first().json;\nconst out = [];\n\nfor (const entry of body.entry || []) {\n  for (const change of entry.changes || []) {\n    const value = change.value || {};\n\n    // Statuses are delivery/read receipts, not messages. Ignore them.\n    if (!value.messages) continue;\n\n    const contactName = ((value.contacts || [])[0] || {}).profile?.name || '';\n\n    for (const message of value.messages) {\n      // Only handle text for now. Images, audio and location go to a human.\n      const isText = message.type === 'text';\n\n      out.push({\n        json: {\n          messageId: message.id,\n          from: message.from,\n          contactName,\n          timestamp: Number(message.timestamp) * 1000,\n          type: message.type,\n          text: isText ? (message.text?.body || '') : '',\n          needsHuman: !isText,\n          phoneNumberId: value.metadata?.phone_number_id || ''\n        }\n      });\n    }\n  }\n}\n\nreturn out;"
+      },
+      "id": "normalise",
+      "name": "Normalise message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "is-text",
+              "leftValue": "={{ $json.needsHuman }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "is-text-message",
+      "name": "Text message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'claude-sonnet-4-6',\n  max_tokens: 1024,\n  system: $('Set config').first().json.extractionPrompt,\n  messages: [\n    { role: 'user', content: $json.text }\n  ]\n}) }}",
+        "options": {
+          "timeout": 30000,
+          "retry": {
+            "retry": {
+              "maxTries": 2,
+              "waitBetweenTries": 1500
+            }
+          }
+        }
+      },
+      "id": "extract-enquiry",
+      "name": "Extract enquiry details",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        420,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the model's JSON and decide what happens next.\n//\n// Two rules that matter:\n//  1. Never trust the model to return clean JSON. Strip fences, then try/catch.\n//  2. Never let the model decide to quote a price. It extracts facts; a human\n//     or your pricing engine decides money.\n\nconst response = $input.first().json;\nconst text = (response.content || [])\n  .filter(block => block.type === 'text')\n  .map(block => block.text)\n  .join('')\n  .replace(/```json|```/g, '')\n  .trim();\n\nlet enquiry;\ntry {\n  enquiry = JSON.parse(text);\n} catch (err) {\n  // Extraction failed. Do not guess — hand to a human.\n  return [{\n    json: {\n      ...$('Normalise message').first().json,\n      parseFailed: true,\n      rawModelOutput: text,\n      status: 'needs_human',\n      missing: ['could not read the message']\n    }\n  }];\n}\n\nconst REQUIRED = ['destination', 'travelDates', 'passengers'];\nconst missing = REQUIRED.filter(field => {\n  const v = enquiry[field];\n  return v === null || v === undefined || v === '' || v === 'unknown';\n});\n\n// Anything the model flagged as complex goes to a person regardless of\n// how complete the extraction looks.\nconst complex = Boolean(enquiry.isComplex) || Boolean(enquiry.mentionsComplaint);\n\nreturn [{\n  json: {\n    ...$('Normalise message').first().json,\n    enquiry,\n    missing,\n    isComplete: missing.length === 0,\n    status: complex ? 'needs_human' : (missing.length === 0 ? 'complete' : 'incomplete')\n  }\n}];"
+      },
+      "id": "parse-extraction",
+      "name": "Parse and validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "complete",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "complete"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "incomplete",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "incomplete"
+            }
+          ]
+        },
+        "fallbackOutput": "extra",
+        "options": {
+          "renameFallbackOutput": "needs_human"
+        }
+      },
+      "id": "route-status",
+      "name": "Route by status",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        860,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compose the reply.\n//\n// Deliberately templated rather than model-generated. A travel enquiry reply\n// that invents a price, a policy or an availability claim is a liability, and\n// a model asked to \"be helpful\" will do exactly that. The model's job in this\n// workflow is extraction only.\n\nconst item = $input.first().json;\nconst config = $('Set config').first().json;\nconst enquiry = item.enquiry || {};\n\nconst QUESTIONS = {\n  destination: 'where you would like to travel to',\n  travelDates: 'roughly when you would like to travel',\n  passengers: 'how many people are travelling'\n};\n\nlet body;\n\nif (item.status === 'complete') {\n  const ref = 'ENQ-' + String(Date.now()).slice(-6);\n  body = `Thanks${item.contactName ? ' ' + item.contactName.split(' ')[0] : ''}. `\n       + `I have your enquiry for ${enquiry.destination}, `\n       + `${enquiry.travelDates}, ${enquiry.passengers} travelling.\\n\\n`\n       + `One of our consultants will come back to you with options `\n       + `${config.responseTimePromise}.\\n\\n`\n       + `Your reference is ${ref}.`;\n  item.reference = ref;\n} else {\n  const asks = (item.missing || [])\n    .map(field => QUESTIONS[field])\n    .filter(Boolean);\n\n  body = `Thanks for getting in touch. To put some options together I just need `\n       + `${asks.length > 1 ? 'a couple of things' : 'one more thing'} — `\n       + `${asks.join(', and ')}?`;\n}\n\nreturn [{ json: { ...item, replyText: body } }];"
+      },
+      "id": "compose-reply",
+      "name": "Compose reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $json.phoneNumberId }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  messaging_product: 'whatsapp',\n  recipient_type: 'individual',\n  to: $json.from,\n  type: 'text',\n  text: { preview_url: false, body: $json.replyText }\n}) }}",
+        "options": {
+          "timeout": 15000,
+          "retry": {
+            "retry": {
+              "maxTries": 3,
+              "waitBetweenTries": 2000
+            }
+          }
+        }
+      },
+      "id": "send-reply",
+      "name": "Send WhatsApp reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{ $('Set config').first().json.sheetId }}",
+        "sheetName": "Enquiries",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Received": "={{ new Date($json.timestamp).toISOString() }}",
+            "Reference": "={{ $json.reference || '' }}",
+            "Name": "={{ $json.contactName }}",
+            "Phone": "={{ $json.from }}",
+            "Destination": "={{ $json.enquiry?.destination || '' }}",
+            "Dates": "={{ $json.enquiry?.travelDates || '' }}",
+            "Passengers": "={{ $json.enquiry?.passengers || '' }}",
+            "Budget": "={{ $json.enquiry?.budget || '' }}",
+            "Trip type": "={{ $json.enquiry?.tripType || '' }}",
+            "Notes": "={{ $json.enquiry?.notes || '' }}",
+            "Status": "={{ $json.status }}",
+            "Original message": "={{ $json.text }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "log-enquiry",
+      "name": "Log to sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1520,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $json.phoneNumberId }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  messaging_product: 'whatsapp',\n  recipient_type: 'individual',\n  to: $json.from,\n  type: 'text',\n  text: { preview_url: false, body: $('Set config').first().json.handoffMessage }\n}) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "send-handoff",
+      "name": "Tell them a person is coming",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1080,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Set config').first().json.teamEmail }}",
+        "subject": "=WhatsApp enquiry needs a person — {{ $json.contactName || $json.from }}",
+        "emailFormat": "text",
+        "message": "=A WhatsApp enquiry could not be handled automatically.\n\nFrom: {{ $json.contactName }} ({{ $json.from }})\nReceived: {{ new Date($json.timestamp).toISOString() }}\nReason: {{ $json.status === 'needs_human' ? 'flagged as complex or non-text' : 'extraction failed' }}\n\nMessage:\n{{ $json.text || '(non-text message — ' + $json.type + ')' }}\n\nWhat was extracted:\n{{ JSON.stringify($json.enquiry || {}, null, 2) }}\n\nReply on WhatsApp Business to continue the conversation.",
+        "options": {}
+      },
+      "id": "notify-team",
+      "name": "Notify the team",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1300,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "sheet",
+              "name": "sheetId",
+              "value": "={{ $env.ENQUIRY_SHEET_ID }}",
+              "type": "string"
+            },
+            {
+              "id": "team",
+              "name": "teamEmail",
+              "value": "={{ $env.TEAM_EMAIL }}",
+              "type": "string"
+            },
+            {
+              "id": "promise",
+              "name": "responseTimePromise",
+              "value": "within 24 hours",
+              "type": "string"
+            },
+            {
+              "id": "handoff",
+              "name": "handoffMessage",
+              "value": "Thanks for your message. One of our consultants will pick this up shortly and reply here.",
+              "type": "string"
+            },
+            {
+              "id": "prompt",
+              "name": "extractionPrompt",
+              "value": "You extract structured travel enquiry details from a customer's WhatsApp message. You do not reply to the customer and you never quote prices, availability or policy.\n\nReturn ONLY a JSON object, with no preamble, no explanation and no markdown fences. Use this exact shape:\n\n{\n  \"destination\": string or null,\n  \"travelDates\": string or null,\n  \"passengers\": string or null,\n  \"budget\": string or null,\n  \"tripType\": string or null,\n  \"notes\": string or null,\n  \"isComplex\": boolean,\n  \"mentionsComplaint\": boolean\n}\n\nRules:\n- Use null for anything the customer did not say. Never guess or infer a destination from a nationality, a language or a greeting.\n- Keep dates as the customer expressed them (\"early June\", \"15-22 Aug\", \"next Eid\"). Do not convert to a format they did not use.\n- passengers: capture adults and children separately if stated, e.g. \"2 adults, 1 child (4)\".\n- notes: anything relevant that does not fit the other fields — accessibility needs, occasions, airline or hotel preferences.\n- isComplex: true for group bookings above 9 people, multi-city itineraries, visa questions, date changes to an existing booking, or anything involving a medical or accessibility requirement.\n- mentionsComplaint: true if the customer is unhappy, chasing something, or referring to a problem with an existing booking.\n\nIf the message is not a travel enquiry at all, set every field to null and isComplex to true.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-config",
+      "name": "Set config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -240,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "OK",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Acknowledge to Meta",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        500
+      ]
+    }
+  ],
+  "connections": {
+    "WhatsApp webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify signature": {
+      "main": [
+        [
+          {
+            "node": "Normalise message",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Set config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set config": {
+      "main": [
+        [
+          {
+            "node": "Acknowledge to Meta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise message": {
+      "main": [
+        [
+          {
+            "node": "Text message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Text message?": {
+      "main": [
+        [
+          {
+            "node": "Extract enquiry details",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Tell them a person is coming",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract enquiry details": {
+      "main": [
+        [
+          {
+            "node": "Parse and validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse and validate": {
+      "main": [
+        [
+          {
+            "node": "Route by status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by status": {
+      "main": [
+        [
+          {
+            "node": "Compose reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Tell them a person is coming",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose reply": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp reply": {
+      "main": [
+        [
+          {
+            "node": "Log to sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tell them a person is coming": {
+      "main": [
+        [
+          {
+            "node": "Notify the team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "travel"
+    },
+    {
+      "name": "whatsapp"
+    }
+  ]
+}

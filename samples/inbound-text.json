@@ -1,0 +1,37 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "102290129340398",
+      "changes": [
+        {
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "447700900123",
+              "phone_number_id": "106540352242922"
+            },
+            "contacts": [
+              {
+                "profile": { "name": "Ayesha Malik" },
+                "wa_id": "447700900456"
+              }
+            ],
+            "messages": [
+              {
+                "from": "447700900456",
+                "id": "wamid.HBgLNDQ3NzAwOTAwNDU2FQIAEhgg",
+                "timestamp": "1790000000",
+                "text": {
+                  "body": "Hi, looking for Umrah packages for my parents in early Ramadan, 2 adults, flying from Manchester. What is included?"
+                },
+                "type": "text"
+              }
+            ]
+          },
+          "field": "messages"
+        }
+      ]
+    }
+  ]
+}
